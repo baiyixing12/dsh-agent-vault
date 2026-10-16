@@ -1,0 +1,6 @@
+# 正规安装（install_bundle / DSHA 插件管理「本地目录」）时，bundle 用这份补丁挂载自己。
+# 如果你更喜欢"自由插入"：不用这份文件，直接把一段 insert 写进 profile 的 cordis.patch.yml，
+# 并把 name 换成插件目录的绝对路径（例如 /root/dsh-agent-vault/index.js）。
+- insert:
+    - id: agent-vault
+      name: dsh-agent-vault
