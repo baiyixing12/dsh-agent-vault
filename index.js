@@ -367,18 +367,38 @@ export function apply(ctx, config) {
     });
   });
 
-  // 每个窗口：绑定谁就注入谁
-  ctx.on('agent/created', ({ agent }) => {
-    const previous = sectionDisposers.get(agent.id);
-    if (previous) { try { previous(); } catch { /* 已释放 */ } }
+  /** 给一个窗口注册注入段；返回 disposer。 */
+  const registerFor = (agent) => {
     const owner = agent.ctx;
-    const dispose = owner.effect(() => owner.systemPrompt.section({
+    return owner.effect(() => owner.systemPrompt.section({
       name: 'agent-vault',
       order: SECTION_ORDER,
       interpolate: false,
       text: () => compose(agent.id),
     }), 'agent-vault: window section');
-    sectionDisposers.set(agent.id, dispose);
+  };
+
+  const attach = (agent) => {
+    const previous = sectionDisposers.get(agent.id);
+    if (previous) { try { previous(); } catch { /* 已释放 */ } }
+    sectionDisposers.set(agent.id, registerFor(agent));
+  };
+
+  // 每个窗口：绑定谁就注入谁
+  ctx.on('agent/created', ({ agent }) => attach(agent));
+
+  // 插件是后装的：已经开着的窗口也要补上（否则当前这个窗口要等重开才生效）
+  ctx.inject(['agents'], (agentsCtx) => {
+    agentsCtx.effect(() => {
+      try {
+        for (const agent of agentsCtx.agents.list()) {
+          if (!sectionDisposers.has(agent.id)) attach(agent);
+        }
+      } catch (error) {
+        ctx.logger?.warn?.(`agent-vault: 补注册现存窗口失败 ${error && error.message}`);
+      }
+      return () => {};
+    }, 'agent-vault: existing windows');
   });
 
   // 累积日志：每条落盘的消息都进 journal（零模型成本）

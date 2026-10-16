@@ -6,9 +6,16 @@ const DIR = '/tmp/agent-vault-selftest';
 rmSync(DIR, { recursive: true, force: true });
 
 const routes = [], listeners = new Map();
+// 模拟"插件装载前就已经开着的窗口"：它也必须被补注册
+const legacySections = [];
+const existingAgents = [{ id: 'sess-legacy', ctx: { effect: (fn) => { const d = fn(); return () => d && d(); }, systemPrompt: { section: (s) => { legacySections.push(s); return () => {}; } } } }];
 const fakeCtx = {
   logger: { info: (...a) => console.log('[info]', ...a), warn: (...a) => console.warn('[warn]', ...a) },
-  inject: (services, callback) => callback({ ...fakeCtx, connection: { registerFetchRoute: (owner, route) => routes.push(route) } }),
+  inject: (services, callback) => callback({
+    ...fakeCtx,
+    connection: { registerFetchRoute: (owner, route) => routes.push(route) },
+    agents: { list: () => existingAgents },
+  }),
   on: (event, handler) => listeners.set(event, handler),
   effect: (fn) => { const dispose = fn(); return () => dispose && dispose(); },
 };
@@ -78,6 +85,11 @@ await call({ action: 'delete', sessionId: 'sess-A', agentId: created.created, co
 check('确认后删除、目录也没了', !existsSync(`${DIR}/${created.created}`));
 check('vault.json 已同步', JSON.parse(readFileSync(`${DIR}/vault.json`, 'utf8')).agents[created.created] === undefined);
 check('非法 id 被拒', Boolean((await call({ action: 'get', agentId: '../etc' })).error));
+
+// 现存窗口补注册
+check('插件后装也会给已开着的窗口注册', legacySections.length === 1 && legacySections[0].name === 'agent-vault');
+const boundLegacy = await call({ action: 'bind', sessionId: 'sess-legacy', agentId: imported.imported });
+check('现存窗口绑定后立刻注入', legacySections[0].text().includes('阿远，好久不见'), `${legacySections[0].text().length} 字`);
 
 console.log(fail.length === 0 ? '\n全部通过' : `\n失败 ${fail.length} 项：${fail.join(', ')}`);
 process.exit(fail.length === 0 ? 0 : 1);
