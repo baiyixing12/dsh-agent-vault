@@ -6,6 +6,28 @@
 - 绑定窗口之后，**每一轮的正文自动追加进日志（journal.jsonl）**，只增不改，零模型成本
 - 关键取舍：DSH 的窗口是 **100 万 tokens**（实测），所以整段历史可以直接带着走，**不需要摘要**（摘要 = 有损 = 克隆）
 
+## 安装（三步，不需要 install_bundle）
+
+```bash
+# 1) 放到任意目录
+git clone https://github.com/baiyixing12/dsh-agent-vault.git /root/dsh-agent-vault
+#    没有 git 就下载 zip 解压，效果一样
+
+# 2) 往 profile 的补丁里插一段（$DSH_HOME/profiles/<profile>/cordis.patch.yml 顶层数组）
+#    - insert:
+#        - id: agent-vault
+#          name: /root/dsh-agent-vault/index.js
+#          config:
+#            dir: /root/.dsh/agent-vault
+#            dshHome: /root/.dsh          # 可选，默认取 $DSH_HOME
+
+# 3) 刷新 DSH 网页：输入框左侧出现「智能体」按钮（设置页也有「智能体」）
+
+node /root/dsh-agent-vault/selftest.mjs   # 可选：36 项自测
+```
+
+要求 **Node ≥ 22.15**（用了内置 `zstdCompressSync`）。卸载 = 删掉那段 YAML；智能体数据留在数据目录里，不会被删。
+
 ## 一个智能体是什么
 
 ```
