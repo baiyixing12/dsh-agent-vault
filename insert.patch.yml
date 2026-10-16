@@ -1,0 +1,7 @@
+# dsh-agent-vault：持久智能体（人设 + 累积日志与记忆）。插到 profile 的 cordis.patch.yml 顶层数组即生效；
+# 删掉本段即卸载（智能体数据留在 /root/.dsh/agent-vault，不会被删）。
+- insert:
+    - id: agent-vault
+      name: /root/dsh-agent-vault/index.js
+      config:
+        dir: /root/.dsh/agent-vault

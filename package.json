@@ -1,0 +1,21 @@
+{
+  "name": "dsh-agent-vault",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "把一段对话变成一个持久智能体：人设 + 持续累积的日志与记忆，按窗口绑定并注入系统提示词",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "client": {
+      "platform": "web",
+      "immediately": false,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-conversation"
+      ]
+    }
+  }
+}
