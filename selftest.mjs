@@ -1,9 +1,18 @@
 /** 自测：假 ctx 走 apply()，验证智能体创建/注入/累积日志/导入解析/绑定隔离。 */
 import { apply } from './index.js';
-import { rmSync, existsSync, readFileSync } from 'node:fs';
+import { rmSync, existsSync, readFileSync, mkdirSync, writeFileSync } from 'node:fs';
+import { zstdDecompressSync, zstdCompressSync } from 'node:zlib';
 
 const DIR = '/tmp/agent-vault-selftest';
+const HOME = '/tmp/agent-vault-selftest-home';
 rmSync(DIR, { recursive: true, force: true });
+rmSync(HOME, { recursive: true, force: true });
+mkdirSync(`${HOME}/storages`, { recursive: true });
+writeFileSync(`${HOME}/storages/workspace.json`, JSON.stringify({
+  unit: { name: 'workspace', version: 2 },
+  global: { initialized: true, workspaceIds: ['ws-1'], archivedSessionIds: [], pinnedSessionIds: [] },
+  tables: { workspaces: { 'ws-1': { path: '/sdcard/dsh', title: 'dsh', sessionIds: ['session-old'], createdAt: '2026-01-01T00:00:00.000Z', updatedAt: '2026-01-01T00:00:00.000Z' } } },
+}, null, 2));
 
 const routes = [], listeners = new Map();
 // 模拟"插件装载前就已经开着的窗口"：它也必须被补注册
@@ -19,7 +28,7 @@ const fakeCtx = {
   on: (event, handler) => listeners.set(event, handler),
   effect: (fn) => { const dispose = fn(); return () => dispose && dispose(); },
 };
-apply(fakeCtx, { dir: DIR });
+apply(fakeCtx, { dir: DIR, dshHome: HOME });
 
 const sections = [];
 const agentCtx = { effect: (fn) => { const dispose = fn(); return () => dispose && dispose(); }, systemPrompt: { section: (section) => { sections.push(section); return () => {}; } } };
@@ -90,6 +99,71 @@ check('非法 id 被拒', Boolean((await call({ action: 'get', agentId: '../etc'
 check('插件后装也会给已开着的窗口注册', legacySections.length === 1 && legacySections[0].name === 'agent-vault');
 const boundLegacy = await call({ action: 'bind', sessionId: 'sess-legacy', agentId: imported.imported });
 check('现存窗口绑定后立刻注入', legacySections[0].text().includes('阿远，好久不见'), `${legacySections[0].text().length} 字`);
+
+
+// ---- 真·会话日志：写入 / 增量追加 / 侧栏登记 ----
+const convo2 = JSON.stringify([
+  { role: 'user', content: '在吗' },
+  { role: 'assistant', content: '在。' },
+  { role: 'user', content: '今晚出来' },
+  { role: 'assistant', content: '穿上外套。' },
+]);
+const previewSession = await call({ action: 'previewSession', text: convo2, cwd: '/sdcard/dsh', title: '她·续#1' });
+check('会话预览：目录 slug 与真实算法一致', previewSession.projectKey === '--sdcard-dsh--', previewSession.projectKey);
+check('会话预览：消息数正确（含标题共 5 个事件）', previewSession.messages === 4 && previewSession.events === 5, `msg=${previewSession.messages} ev=${previewSession.events}`);
+check('会话预览不落盘', !existsSync(previewSession.path));
+
+const written = await call({ action: 'writeSession', text: convo2, cwd: '/sdcard/dsh', title: '她·续#1' });
+check('写了会话日志', written.written && existsSync(written.written.path));
+check('侧栏已登记', written.written.registered === true);
+const registry = JSON.parse(readFileSync(`${HOME}/storages/workspace.json`, 'utf8'));
+const wsEntry = Object.values(registry.tables.workspaces).find((w) => w.path === '/sdcard/dsh');
+check('登记进对应工作区且插到最前', Boolean(wsEntry) && wsEntry.sessionIds[0] === written.written.sessionId && wsEntry.sessionIds.includes('session-old'));
+check('workspace.json 有备份', existsSync(`${HOME}/storages/workspace.json.bak`));
+
+const raw = readFileSync(written.written.path);
+const decoded = zstdDecompressSync(raw).toString('utf8').split('\n').filter(Boolean).map((line) => JSON.parse(line));
+check('首行是合法会话头', decoded[0].type === 'session' && decoded[0].version === 4 && decoded[0].cwd === '/sdcard/dsh'
+  && decoded[0].id === written.written.sessionId && decoded[0].isSeeded === false);
+check('消息事件角色与顺序正确',
+  decoded.filter((e) => e.type === 'user/message').length === 2
+  && decoded.filter((e) => e.type === 'assistant/message').length === 2
+  && decoded[1].type === 'user/message' && decoded[2].type === 'assistant/message');
+check('事件信封只有允许的键', decoded.slice(1).every((e) => Object.keys(e).every((k) =>
+  ['type', 'seq', 'time', 'data', 'surfaceOp', 'sourceEventSeqs', 'ignorable'].includes(k))));
+check('seq 递增且 time 是整数', decoded.slice(1).every((e, i, arr) =>
+  Number.isInteger(e.seq) && Number.isInteger(e.time) && (i === 0 || e.seq > arr[i - 1].seq)));
+check('正文可回读', decoded.some((e) => JSON.stringify(e).includes('穿上外套')));
+check('标题事件写入', decoded.some((e) => e.type === 'session/title' && e.data.title === '她·续#1'));
+
+// 增量同步：把网页端的新几条追加到同一个会话
+const beforeFrames = readFileSync(written.written.path).length;
+const synced = await call({
+  action: 'syncSession', cwd: '/sdcard/dsh', targetSessionId: written.written.sessionId, text: JSON.stringify([
+    { role: 'user', content: '我又来了' },
+    { role: 'assistant', content: '嗯，坐。' },
+  ]),
+});
+check('追加同步成功', synced.synced && synced.synced.appended === 2, JSON.stringify(synced.synced || synced.error));
+check('追加后 seq 继续（不冲突）', synced.synced.maxSeq > 6, `${synced.synced.maxSeq}`);
+const afterText = (() => {
+  const buf = readFileSync(written.written.path);
+  const MAGIC = Buffer.from([0x28, 0xB5, 0x2F, 0xFD]);
+  const offs = [];
+  let at = 0;
+  while ((at = buf.indexOf(MAGIC, at)) !== -1) { offs.push(at); at += 4; }
+  let out = '';
+  for (let i = 0; i < offs.length; i += 1) {
+    const end = i + 1 < offs.length ? offs[i + 1] : buf.length;
+    try { out += zstdDecompressSync(buf.subarray(offs[i], end)).toString('utf8'); } catch { /* 跳过 */ }
+  }
+  return out;
+})();
+check('追加内容确实进了日志', afterText.includes('我又来了') && afterText.includes('坐。'));
+check('文件确实变长了（多帧追加）', readFileSync(written.written.path).length > beforeFrames);
+const finalSeqs = afterText.split('\n').filter(Boolean).map((l) => JSON.parse(l)).filter((e) => typeof e.seq === 'number').map((e) => e.seq);
+check('全日志 seq 无重复', new Set(finalSeqs).size === finalSeqs.length, `${finalSeqs.length} 条事件`);
+check('同步到不存在的会话会报错', Boolean((await call({ action: 'syncSession', cwd: '/sdcard/dsh', targetSessionId: 'session-nope', text: convo2 })).error));
 
 console.log(fail.length === 0 ? '\n全部通过' : `\n失败 ${fail.length} 项：${fail.join(', ')}`);
 process.exit(fail.length === 0 ? 0 : 1);

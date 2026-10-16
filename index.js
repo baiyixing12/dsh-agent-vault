@@ -17,6 +17,8 @@
 
 import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync, appendFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { randomUUID } from 'node:crypto';
+import { zstdCompressSync, zstdDecompressSync } from 'node:zlib';
 
 const ROUTE = '/api/agent-vault';
 const SECTION_ORDER = 120;
@@ -65,6 +67,150 @@ export function apply(ctx, config) {
   };
 
   const newId = () => `agent-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+
+  // ------------------------------------------------- 真·会话日志（不是"记忆"）
+
+  const dshHome = (config && config.dshHome) || process.env.DSH_HOME || '/root/.dsh';
+  const sessionsRoot = join(dshHome, 'sessions');
+  const workspaceFile = join(dshHome, 'storages', 'workspace.json');
+
+  /** 与 @deepseek-ai/dsh-session-persistence-jsonl 的 projectKey 完全一致。 */
+  function projectKey(cwd) {
+    if (!cwd.length) throw new Error('空的目录路径');
+    let readable = '';
+    let separatorRun = false;
+    for (let i = 0; i < cwd.length; i += 1) {
+      const code = cwd.charCodeAt(i);
+      const ch = String.fromCharCode(code);
+      if (ch === '/' || ch === '\\' || ch === ':') {
+        if (!separatorRun) readable += '-';
+        separatorRun = true;
+      } else if (ch !== '~' && /^[A-Za-z0-9._-]$/.test(ch)) {
+        readable += ch;
+        separatorRun = false;
+      } else {
+        readable += `~${code.toString(16).toUpperCase().padStart(4, '0')}`;
+        separatorRun = false;
+      }
+    }
+    return `--${(readable.replace(/^-+/, '') || 'root').slice(0, 251)}--`;
+  }
+
+  const logPath = (cwd, sessionId) => join(sessionsRoot, projectKey(cwd), sessionId, 'session.v4.jsonl.zstd');
+
+  /** 一条既有消息 → 一条 DSH 会话事件（形状照真实日志）。 */
+  function eventOf(message, seq, time, turn) {
+    if (message.role === 'assistant') {
+      return {
+        type: 'assistant/message', seq, time,
+        data: { turn, step: 1, message: { role: 'assistant', content: [{ type: 'text', text: message.text }] } },
+      };
+    }
+    if (message.role === 'system') {
+      return {
+        type: 'system/message', seq, time,
+        data: { turn, step: 1, message: { role: 'system', content: [{ type: 'text', text: message.text }] } },
+      };
+    }
+    return {
+      type: 'user/message', seq, time,
+      data: {
+        content: [{ type: 'text', text: message.text }],
+        source: { kind: 'user', rpcId: randomUUID(), clientTimeZone: 'Asia/Shanghai' },
+        role: 'user',
+        id: randomUUID(),
+      },
+      surfaceOp: 'append',
+    };
+  }
+
+  function buildLog({ messages, cwd, title, sessionId, turnStart = 1 }) {
+    const id = sessionId || `session-${randomUUID()}`;
+    const createdAt = Date.now();
+    const lines = [JSON.stringify({
+      type: 'session', version: 4, id, createdAt, cwd, isSeeded: false, delegationDepth: 0,
+      agentPreset: (config && config.agentPreset) || 'standard',
+    })];
+    let seq = 1;
+    let turn = turnStart;
+    for (const message of messages) {
+      if (!message || !message.text || !String(message.text).trim()) continue;
+      lines.push(JSON.stringify(eventOf(message, seq, createdAt + seq * 10, turn)));
+      if (message.role === 'assistant') turn += 1;
+      seq += 1;
+    }
+    if (title) {
+      lines.push(JSON.stringify({
+        type: 'session/title', seq, time: createdAt + seq * 10,
+        data: { title: String(title).slice(0, 80), messageSeqs: [1], source: { kind: 'fallback' } },
+      }));
+    }
+    return { id, createdAt, lines };
+  }
+
+  /** 读一份既有日志，取回它的 cwd / 最大 seq / 最多帧数。 */
+  function inspectLog(file) {
+    const buf = readFileSync(file);
+    const MAGIC = Buffer.from([0x28, 0xB5, 0x2F, 0xFD]);
+    const offsets = [];
+    let at = 0;
+    while ((at = buf.indexOf(MAGIC, at)) !== -1) { offsets.push(at); at += 4; }
+    let text = '';
+    let frames = 0;
+    for (let i = 0; i < offsets.length; i += 1) {
+      const end = i + 1 < offsets.length ? offsets[i + 1] : buf.length;
+      try { text += zstdDecompressSync(buf.subarray(offsets[i], end)).toString('utf8'); frames += 1; } catch { /* 跳过坏帧 */ }
+    }
+    let header = null;
+    let maxSeq = 0;
+    for (const line of text.split('\n')) {
+      if (!line.trim()) continue;
+      try {
+        const event = JSON.parse(line);
+        if (event.type === 'session' && !header) header = event;
+        if (typeof event.seq === 'number' && event.seq > maxSeq) maxSeq = event.seq;
+      } catch { /* 忽略 */ }
+    }
+    return { header, maxSeq, frames, bytes: buf.length };
+  }
+
+  /** 把新消息作为一帧追加到既有会话（就是"不断同步"的机制）。 */
+  function appendToLog(sessionId, cwd, messages) {
+    const file = logPath(cwd, sessionId);
+    if (!existsSync(file)) return null;
+    const info = inspectLog(file);
+    const built = buildLog({ messages, cwd, sessionId });
+    const fresh = built.lines.slice(1).map((line) => {
+      const event = JSON.parse(line);
+      if (typeof event.seq === 'number') event.seq += info.maxSeq;
+      return JSON.stringify(event);
+    });
+    if (fresh.length === 0) return { appended: 0, maxSeq: info.maxSeq };
+    appendFileSync(file, zstdCompressSync(Buffer.from(`${fresh.join('\n')}\n`)), { mode: 0o600 });
+    return { appended: fresh.length, maxSeq: info.maxSeq + fresh.length };
+  }
+
+  /** 让新会话出现在侧栏：登记进 workspace.json（先备份）。 */
+  function registerInWorkspace(cwd, sessionId, title) {
+    let registry;
+    try { registry = JSON.parse(readFileSync(workspaceFile, 'utf8')); } catch { return { registered: false, reason: 'workspace.json 读不到' }; }
+    const table = registry.tables && registry.tables.workspaces;
+    if (!table || !Array.isArray(registry.global && registry.global.workspaceIds)) return { registered: false, reason: 'workspace.json 结构不认识' };
+    try { writeFileSync(`${workspaceFile}.bak`, readFileSync(workspaceFile), { mode: 0o600 }); } catch { /* 备份失败也继续 */ }
+    let entry = Object.entries(table).find(([, value]) => value && value.path === cwd);
+    if (!entry) {
+      const id = randomUUID();
+      table[id] = { path: cwd, title: title || cwd.split('/').filter(Boolean).pop() || cwd, sessionIds: [sessionId], createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() };
+      registry.global.workspaceIds.unshift(id);
+      entry = [id, table[id]];
+    } else {
+      const list = Array.isArray(entry[1].sessionIds) ? entry[1].sessionIds : [];
+      entry[1].sessionIds = [sessionId, ...list.filter((value) => value !== sessionId)];
+      entry[1].updatedAt = new Date().toISOString();
+    }
+    writeFileSync(workspaceFile, `${JSON.stringify(registry, null, 2)}\n`, { mode: 0o600 });
+    return { registered: true, workspaceId: entry[0] };
+  }
 
   // ---------------------------------------------------------------- 正文抽取
 
@@ -342,6 +488,40 @@ export function apply(ctx, config) {
         head: transcript.slice(0, 400),
         tail: transcript.slice(-400),
       };
+    }
+
+    if (action === 'previewSession' || action === 'writeSession') {
+      const raw = typeof payload.text === 'string' ? payload.text.replace(/^\uFEFF/, '') : payload.text;
+      const messages = Array.isArray(payload.messages) ? payload.messages : extractMessages(raw);
+      const cwd = String(payload.cwd || '/sdcard/dsh').trim();
+      if (!cwd.startsWith('/')) return { error: '目标目录要写绝对路径' };
+      if (messages.length === 0) return { error: '没解析出消息' };
+      const built = buildLog({ messages, cwd, title: payload.title });
+      if (action === 'previewSession') {
+        return {
+          dir: root, cwd, projectKey: projectKey(cwd), sessionId: built.id,
+          path: logPath(cwd, built.id), events: built.lines.length - 1, messages: messages.length,
+          chars: messages.reduce((sum, message) => sum + String(message.text || '').length, 0),
+          head: built.lines.slice(0, 3),
+        };
+      }
+      const target = logPath(cwd, built.id);
+      mkdirSync(join(sessionsRoot, projectKey(cwd), built.id), { recursive: true });
+      writeFileSync(target, zstdCompressSync(Buffer.from(`${built.lines.join('\n')}\n`)), { mode: 0o600 });
+      const registration = registerInWorkspace(cwd, built.id, payload.title);
+      return { ...snapshot(sessionId), written: { sessionId: built.id, path: target, events: built.lines.length - 1, ...registration } };
+    }
+
+    if (action === 'syncSession') {
+      const raw = typeof payload.text === 'string' ? payload.text.replace(/^\uFEFF/, '') : payload.text;
+      const messages = Array.isArray(payload.messages) ? payload.messages : extractMessages(raw);
+      const cwd = String(payload.cwd || '/sdcard/dsh').trim();
+      const targetSession = String(payload.targetSessionId || '').trim();
+      if (!targetSession || !cwd.startsWith('/')) return { error: '同步要指定 targetSessionId 与绝对 cwd' };
+      if (messages.length === 0) return { error: '没解析出新消息' };
+      const result = appendToLog(targetSession, cwd, messages);
+      if (!result) return { error: `找不到会话日志：${logPath(cwd, targetSession)}` };
+      return { ...snapshot(sessionId), synced: { sessionId: targetSession, ...result } };
     }
 
     return { error: `unknown action: ${action}` };

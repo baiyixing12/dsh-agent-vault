@@ -51,3 +51,27 @@
 ```
 node /root/dsh-agent-vault/selftest.mjs     # 20 项：注入/累积/隔离/导入解析/删除
 ```
+
+## V2：把历史写成「真正的会话」（她本人续写，不是带着记忆的新窗口）
+
+区别在于模型看到的是什么：
+
+| | V1（记忆模式） | V2（真实会话） |
+|---|---|---|
+| 模型看到 | `<memory>` 里的一段"史料" | 你我交替的 **真实消息序列** |
+| 连续性 | 像"知道她的事" | 像"刚跟她说完话" |
+| 落点 | `memory.md` | `sessions/<cwd slug>/session-<id>/session.v4.jsonl.zstd` |
+
+V2 已实现并验证的能力：
+
+- `previewSession`：先算给你看（目录 slug、消息数、事件数、目标路径），**不落盘**
+- `writeSession`：生成会话日志（头 + `user/message` / `assistant/message` / `session/title` 事件），
+  并登记进 `storages/workspace.json`（**先备份** `.bak`），侧栏立刻可见
+- `syncSession`：把新消息**追加为一帧**到既有会话 —— 这就是"不断同步"的机制。
+  会话日志本来就是"一事件一帧 zstd"（本机实测那份有 900+ 帧），追加不破坏原有内容，`seq` 自动接续
+
+格式细节照抄真机日志：头 `version:4 / id / createdAt / cwd / isSeeded / agentPreset`；
+事件信封只允许 `type/seq/time/data/surfaceOp/sourceEventSeqs/ignorable`；目录名用与
+`@deepseek-ai/dsh-session-persistence-jsonl` 完全一致的 `projectKey`（`/sdcard/dsh` → `--sdcard-dsh--`）。
+
+**注意**：外部追加的帧，运行中的 harness 不会立刻看见（它按自己的内存状态写）；要看到新内容需要刷新/重开会话。
